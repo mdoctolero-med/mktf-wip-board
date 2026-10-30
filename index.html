@@ -990,14 +990,12 @@ async function loadFile(file,handle){
   setFileStatus(); persist(); render();
 }
 async function pickAndOpen(){
-  if(!(await requireAuth())) return;
   if(hasFS){
     try{ const [h]=await window.showOpenFilePicker({types:[{description:"Excel workbook",accept:{[XLSX_TYPE]:[".xlsx",".xlsm"],"application/vnd.ms-excel.sheet.macroEnabled.12":[".xlsm"]}}]}); await loadFile(await h.getFile(),h); }
     catch(e){ if(e&&e.name!=="AbortError") fsError(e,"open the file"); }
   } else $("#fileInput").click();
 }
 async function reloadFromFile(skipDirtyCheck){
-  if(!(await requireAuth())) return;
   if(!fileHandle) return pickAndOpen();
   if(!skipDirtyCheck && fileDirty){ banner(`You have changes that aren't in <b>${esc(fileName)}</b> yet. Loading the file will drop them.`,[["Save mine first",()=>{banner();saveToFile();},true],["Load file anyway",()=>{banner();reloadFromFile(true);}],["Cancel",()=>banner()]]); return; }
   if(!(await ensurePerm(fileHandle))){ toast("Allow access to the file to load it"); return; }
@@ -1013,7 +1011,7 @@ $("#reloadBtn").onclick=()=>reloadFromFile(false);
 $("#fileInput").addEventListener("change",async e=>{ const f=e.target.files[0]; e.target.value=""; if(f) await loadFile(f,null); });
 window.addEventListener("beforeunload",e=>{ if(fileDirty&&rows.length){ e.preventDefault(); e.returnValue=""; } });
 document.addEventListener("dragover",e=>{ if([...(e.dataTransfer?.types||[])].includes("Files")) e.preventDefault(); });
-document.addEventListener("drop",async e=>{ const f=e.dataTransfer?.files?.[0]; if(!f) return; e.preventDefault(); if(!(await requireAuth())) return;
+document.addEventListener("drop",async e=>{ const f=e.dataTransfer?.files?.[0]; if(!f) return; e.preventDefault();
   let h=null; try{ const it=e.dataTransfer.items?.[0]; if(it&&it.getAsFileSystemHandle) h=await it.getAsFileSystemHandle(); }catch(_){}
   await loadFile(f,h&&h.kind==="file"?h:null); });
 $("#reloadBtn").hidden=!hasFS;
