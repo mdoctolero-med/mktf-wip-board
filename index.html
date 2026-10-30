@@ -264,6 +264,7 @@ table.rep2 td.t{font-weight:700}
     <span class="today" id="today"></span>
     <span class="fstatus" id="fileStatus" aria-live="polite"></span>
     <span class="lockstate" id="lockState" hidden>Admin unlocked · <button type="button" class="linkbtn" id="lockBtn">Lock</button></span>
+    <button class="btn" id="msBtn" type="button" hidden>Sign in with Microsoft</button>
     <button class="btn" id="openBtn" type="button">Open Excel</button>
     <button class="btn" id="reloadBtn" type="button" title="Load the latest saved version of the linked file">Load latest</button>
     <button class="btn" id="saveBtn2" type="button">Save</button>
@@ -903,13 +904,14 @@ const idb=(()=>{ let p; const open=()=>p||(p=new Promise((res,rej)=>{ const r=in
   return {get:k=>tx("readonly",s=>s.get(k)).catch(()=>undefined), set:(k,v)=>tx("readwrite",s=>s.put(v,k)).catch(()=>{}), del:k=>tx("readwrite",s=>s.delete(k)).catch(()=>{})};
 })();
 let fileHandle=null, fileName="", fileStamp=0, fileDirty=false, cacheT=null, autoT=null, fileMode="board", reportBytes=null;
+let cloud=null; // OneDrive file when signed in with Microsoft: {driveId,itemId,eTag,name,webUrl}
 function persist(){ clearTimeout(cacheT); cacheT=setTimeout(()=>idb.set("state",{rows,fileName,fileDirty,fileMode}),300); }
 
 /* ---------- header file status + banner ---------- */
 function setFileStatus(){
   const el=$("#fileStatus");
   if(!fileName){ el.innerHTML=`<span class="fdot off"></span>No file linked`; }
-  else el.innerHTML=`<span class="fdot ${fileDirty?"dirty":"ok"}"></span><span class="fname" title="${esc(fileName)}">${esc(fileName)}</span><span class="fstate">${fileDirty?(fileHandle&&fileMode==="board"?"saving…":"unsaved changes — click Save"):"saved"}</span>`;
+  else el.innerHTML=`<span class="fdot ${fileDirty?"dirty":"ok"}"></span><span class="fname" title="${esc(fileName)}">${cloud?"OneDrive · ":""}${esc(fileName)}</span><span class="fstate">${fileDirty?(fileHandle&&fileMode==="board"?"saving…":"unsaved changes — click Save"):"saved"}</span>`;
   $("#saveBtn2").classList.toggle("primary",fileDirty);
 }
 function banner(html,actions){
@@ -933,6 +935,7 @@ async function sheetNamesOf(file){ try{ return XLSX.read(await file.arrayBuffer(
 const hasWip = names => names.some(n=>n.toLowerCase().replace(/[^a-z]/g,"")==="workinprogress");
 async function saveToFile({auto=false,force=false,saveAs=false}={}){
   if(!window.XLSX){ toast("The Excel library failed to start — reload the page"); return; }
+  if(cloud && !saveAs) return cloudSave({force});
   if(fileHandle && !saveAs){
     if(!(await ensurePerm(fileHandle))){ if(!auto) toast("Allow editing the file to save"); else banner(`Changes are kept in this browser. Click <b>Save</b> to write them to <b>${esc(fileName)}</b>.`,[["Save",()=>{banner();saveToFile();},true]]); return; }
     try{
@@ -978,6 +981,7 @@ async function saveToFile({auto=false,force=false,saveAs=false}={}){
 }
 async function loadFile(file,handle){
   if(!window.XLSX){ toast("The Excel library failed to start — reload the page"); return; }
+  cloud=null; // a file opened from this PC; cloudLoad() sets it again for OneDrive files
   let parsed, buf;
   try{ buf=await file.arrayBuffer(); parsed=parseWorkbook(buf); }catch(e){ banner(`Couldn't read <b>${esc(file.name)}</b>. ${esc(e.message||"")} Pick the WIP report or a file saved from this board.`,[["OK",()=>banner()]]); return; }
   rows=parsed.recs; rowsLoaded=true; fileName=file.name; fileDirty=false; fileStamp=file.lastModified;
@@ -996,6 +1000,10 @@ async function pickAndOpen(){
   } else $("#fileInput").click();
 }
 async function reloadFromFile(skipDirtyCheck){
+  if(cloud || (!fileHandle && msOk && tokens())){
+    if(!skipDirtyCheck && fileDirty){ banner(`You have changes that aren't saved to OneDrive yet. Loading the file will drop them.`,[["Save mine first",()=>{banner();saveToFile();},true],["Load file anyway",()=>{banner();cloudLoad();}],["Cancel",()=>banner()]]); return; }
+    return cloudLoad();
+  }
   if(!fileHandle) return pickAndOpen();
   if(!skipDirtyCheck && fileDirty){ banner(`You have changes that aren't in <b>${esc(fileName)}</b> yet. Loading the file will drop them.`,[["Save mine first",()=>{banner();saveToFile();},true],["Load file anyway",()=>{banner();reloadFromFile(true);}],["Cancel",()=>banner()]]); return; }
   if(!(await ensurePerm(fileHandle))){ toast("Allow access to the file to load it"); return; }
@@ -1097,6 +1105,169 @@ function requireAuth(){
 }
 $("#lockBtn").onclick=()=>{ adminOk=false; try{ sessionStorage.removeItem("wipAdmin"); }catch(e){} setLockUi(); toast("Locked — Open Excel and Load latest need the admin login again"); };
 setLockUi();
+/* ---------- OneDrive / SharePoint via Microsoft sign-in (Microsoft Graph) ---------- */
+const MS = {
+  tenant: "f1ebdfae-e2bf-4578-b6b2-cdac6657b7b3",
+  client: "7e74bfc0-91cc-44fd-b6d4-f0482e369450",
+  redirect: "https://mdoctolero-med.github.io/mktf-wip-board/",
+  scope: "openid profile offline_access User.Read Files.ReadWrite.All",
+};
+const DEFAULT_LINK = "https://medenterprise2028-my.sharepoint.com/personal/marcialdoctolero_medenterprise2028_onmicrosoft_com/Documents/Shared%20Files/MKTF%20WIP%20Report.xlsx";
+const GRAPH = "https://graph.microsoft.com/v1.0";
+const msOk = location.href.startsWith(MS.redirect);   // sign-in only works from the published address
+const ls = { get:k=>{ try{ return localStorage.getItem(k); }catch(e){ return null; } }, set:(k,v)=>{ try{ v==null?localStorage.removeItem(k):localStorage.setItem(k,v); }catch(e){} } };
+const b64url = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+const randStr = n => b64url(crypto.getRandomValues(new Uint8Array(n)));
+function cloudLink(){ return ls.get("wipCloudLink") || DEFAULT_LINK; }
+function shareId(url){
+  let u=url.trim();
+  if(!/\/:[a-z]:\//i.test(u)) u=u.split("?")[0].split("#")[0];     // plain file address: drop ?web=1 etc.
+  return "u!"+btoa(unescape(encodeURIComponent(u))).replace(/=+$/,"").replace(/\//g,"_").replace(/\+/g,"-");
+}
+function tokens(){ try{ return JSON.parse(ls.get("wipMsTok")||"null"); }catch(e){ return null; } }
+function saveTokens(t){ ls.set("wipMsTok", t?JSON.stringify(t):null); }
+async function msSignIn(){
+  const verifier=randStr(48), state=randStr(16);
+  const challenge=b64url(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(verifier)));
+  try{ sessionStorage.setItem("wipPkce",JSON.stringify({verifier,state})); }catch(e){}
+  const q=new URLSearchParams({client_id:MS.client,response_type:"code",redirect_uri:MS.redirect,response_mode:"query",scope:MS.scope,state,code_challenge:challenge,code_challenge_method:"S256",prompt:"select_account"});
+  location.assign(`https://login.microsoftonline.com/${MS.tenant}/oauth2/v2.0/authorize?${q}`);
+}
+async function tokenRequest(params){
+  const r=await fetch(`https://login.microsoftonline.com/${MS.tenant}/oauth2/v2.0/token`,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({client_id:MS.client,scope:MS.scope,...params})});
+  const j=await r.json(); if(!r.ok) throw new Error(j.error_description||j.error||("HTTP "+r.status));
+  return {access:j.access_token,refresh:j.refresh_token,exp:Date.now()+(j.expires_in-90)*1000};
+}
+async function msHandleRedirect(){
+  const p=new URLSearchParams(location.search);
+  if(!p.has("code")&&!p.has("error")) return false;
+  history.replaceState(null,"",MS.redirect);
+  if(p.has("error")){ banner(`<b>Microsoft sign-in didn't finish.</b> ${esc(p.get("error_description")||p.get("error"))}`,[["Try again",()=>msSignIn(),true],["OK",()=>banner()]]); return false; }
+  let pk=null; try{ pk=JSON.parse(sessionStorage.getItem("wipPkce")||"null"); sessionStorage.removeItem("wipPkce"); }catch(e){}
+  if(!pk||pk.state!==p.get("state")){ banner("Sign-in was interrupted. Please sign in again.",[["Sign in",()=>msSignIn(),true]]); return false; }
+  try{ saveTokens(await tokenRequest({grant_type:"authorization_code",code:p.get("code"),redirect_uri:MS.redirect,code_verifier:pk.verifier})); ls.set("wipCloudOn","1"); return true; }
+  catch(e){ banner(`<b>Couldn't finish signing in.</b> ${esc(e.message)}`,[["Try again",()=>msSignIn(),true]]); return false; }
+}
+async function msToken(){
+  const t=tokens(); if(!t) return null;
+  if(t.access && Date.now()<t.exp) return t.access;
+  try{ const n=await tokenRequest({grant_type:"refresh_token",refresh_token:t.refresh}); saveTokens(n); return n.access; }
+  catch(e){ saveTokens(null); return null; }
+}
+function msSignOut(){
+  saveTokens(null); ls.set("wipCloudOn",null); ls.set("wipMsUser",null); cloud=null; setMsUi(); setFileStatus();
+  toast("Signed out of Microsoft");
+}
+async function graph(path,opts={}){
+  const tok=await msToken(); if(!tok){ const e=new Error("Sign in with Microsoft first."); e.status=401; throw e; }
+  const r=await fetch(path.startsWith("http")?path:GRAPH+path,{...opts,headers:{...(opts.headers||{}),Authorization:"Bearer "+tok}});
+  if(!r.ok){ let m=""; try{ const j=await r.json(); m=j.error&&j.error.message||""; }catch(_){} const e=new Error(m||("HTTP "+r.status)); e.status=r.status; throw e; }
+  return r;
+}
+function cloudError(e,what){
+  const s=e&&e.status;
+  const hint = s===401 ? "Your Microsoft sign-in expired. Sign in again."
+    : s===403 ? "Your account doesn't have edit access to this file. Ask the owner to share it with you as “Can edit”."
+    : s===404 ? "The file wasn't found. It may have been moved or renamed; use “Change file link” to pick it again."
+    : s===423 ? "The file is locked, usually because someone has it open in desktop Excel. Ask them to close it, then Save again."
+    : s===412 ? "Someone else saved the file after you loaded it."
+    : /Failed to fetch|NetworkError/i.test(e&&e.message||"") ? "No internet connection, or the connection dropped. Your changes are kept here; Save again when you're back online."
+    : "";
+  banner(`<b>Couldn't ${what}.</b> ${hint} <span class="diag">${esc(e&&e.message||String(e))}</span>`,
+    s===401?[["Sign in",()=>msSignIn(),true]]:[["OK",()=>banner()]]);
+}
+async function cloudLoad(){
+  if(!msOk) return;
+  const st=$("#fileStatus"); st.innerHTML=`<span class="fdot dirty"></span>Loading from OneDrive…`;
+  try{
+    const meta=await (await graph(`/shares/${shareId(cloudLink())}/driveItem?$select=id,name,eTag,parentReference,webUrl,size`)).json();
+    const buf=await (await graph(`/drives/${meta.parentReference.driveId}/items/${meta.id}/content`)).arrayBuffer();
+    await loadFile(new File([buf],meta.name,{lastModified:Date.now()}),null);
+    cloud={driveId:meta.parentReference.driveId,itemId:meta.id,eTag:meta.eTag,name:meta.name,webUrl:meta.webUrl};
+    if(fileMode==="report") reportBytes=new Uint8Array(buf);
+    fileDirty=false; setFileStatus(); persist(); setMsUi();
+    toast(`Loaded ${meta.name} from OneDrive — ${rows.length} ROs`);
+  }catch(e){ setFileStatus(); cloudError(e,"load the file from OneDrive"); }
+}
+async function uploadBytes(data,ifMatch){
+  const base=`/drives/${cloud.driveId}/items/${cloud.itemId}`;
+  const body=new Blob([data],{type:XLSX_TYPE});
+  if(body.size<4*1024*1024){
+    return await (await graph(`${base}/content`,{method:"PUT",headers:{"Content-Type":XLSX_TYPE,"If-Match":ifMatch},body})).json();
+  }
+  const sess=await (await graph(`${base}/createUploadSession`,{method:"POST",headers:{"Content-Type":"application/json","If-Match":ifMatch},body:JSON.stringify({item:{"@microsoft.graph.conflictBehavior":"replace"}})})).json();
+  const CH=320*1024*32, total=body.size; let res=null;
+  for(let start=0;start<total;start+=CH){
+    const end=Math.min(start+CH,total)-1;
+    const fs=$("#fileStatus").querySelector(".fstate"); if(fs) fs.textContent=`saving… ${Math.round(end/total*100)}%`;
+    const r=await fetch(sess.uploadUrl,{method:"PUT",headers:{"Content-Range":`bytes ${start}-${end}/${total}`},body:body.slice(start,end+1)});
+    if(!r.ok && r.status!==202){ let m=""; try{ m=(await r.json()).error.message; }catch(_){} const e=new Error(m||("HTTP "+r.status)); e.status=r.status; throw e; }
+    if(r.status===200||r.status===201) res=await r.json();
+  }
+  return res;
+}
+async function cloudSave({force=false}={}){
+  if(!cloud) return cloudLoad();
+  const fs=$("#fileStatus").querySelector(".fstate"); if(fs) fs.textContent="saving…";
+  try{
+    const meta=await (await graph(`/drives/${cloud.driveId}/items/${cloud.itemId}?$select=eTag`)).json();
+    if(!force && meta.eTag!==cloud.eTag){
+      banner(`<b>${esc(cloud.name)}</b> was changed by someone else after you loaded it. Saving now would overwrite their changes.`,[
+        ["Load their version",()=>{banner();reloadFromFile(true);},true],
+        ["Overwrite with mine",()=>{banner();cloudSave({force:true});}]]);
+      setFileStatus(); return;
+    }
+    let base=reportBytes;
+    if(fileMode==="report" && (force || !base)){ base=new Uint8Array(await (await graph(`/drives/${cloud.driveId}/items/${cloud.itemId}/content`)).arrayBuffer()); }
+    const out = fileMode==="report" ? new Uint8Array(patchReportBytes(base)) : buildWorkbook();
+    const item=await uploadBytes(out, meta.eTag);
+    cloud.eTag=(item&&item.eTag)||cloud.eTag;
+    if(fileMode==="report") reportBytes=out;
+    fileDirty=false; setFileStatus(); persist(); toast(`Saved to ${cloud.name} on OneDrive`);
+  }catch(e){ fileDirty=true; setFileStatus(); cloudError(e,"save to OneDrive"); }
+}
+function setMsUi(){
+  const b=$("#msBtn"); if(!b) return;
+  b.hidden=!msOk;
+  const signed=!!tokens();
+  b.textContent = signed ? (ls.get("wipMsUser")||"Microsoft account") : "Sign in with Microsoft";
+  b.classList.toggle("primary",!signed);
+  b.title = signed ? "OneDrive file and sign-out options" : "Load and save the report straight from OneDrive";
+  if(signed || cloud){ $("#reloadBtn").hidden=false; $("#saveBtn2").textContent="Save"; }
+}
+function msMenu(){
+  if(!tokens()){ msSignIn(); return; }
+  banner(`Signed in as <b>${esc(ls.get("wipMsUser")||"your Microsoft account")}</b>. The board loads and saves <b>${esc(cloud?cloud.name:decodeURIComponent(cloudLink().split("?")[0].split("/").pop()))}</b> on OneDrive.`,[
+    ["Load latest",()=>{banner();reloadFromFile(false);},true],
+    ["Change file link",()=>askLink()],
+    ["Sign out",()=>{banner();msSignOut();}],
+    ["Close",()=>banner()]]);
+}
+function askLink(){
+  banner(`Paste the OneDrive or SharePoint link of the Excel file (the address of the file, or a “Copy link” share link):<br><input id="linkIn" type="url" class="field-sm" style="width:100%;margin-top:6px" value="${esc(cloudLink())}">`,[
+    ["Use this file",()=>{ const v=$("#linkIn").value.trim(); if(!/^https:\/\/[^/]+\.sharepoint\.com\//i.test(v)&&!/^https:\/\/(1drv\.ms|onedrive\.live\.com)\//i.test(v)){ toast("That isn't a OneDrive or SharePoint link"); return; } ls.set("wipCloudLink",v); banner(); cloud=null; cloudLoad(); },true],
+    ["Use the default report",()=>{ ls.set("wipCloudLink",null); banner(); cloud=null; cloudLoad(); }],
+    ["Cancel",()=>banner()]]);
+  setTimeout(()=>{ const i=$("#linkIn"); if(i){ i.focus(); i.select(); } },30);
+}
+async function cloudBoot(){
+  setMsUi();
+  if(!msOk) return;
+  $("#msBtn").onclick=msMenu;
+  await msHandleRedirect();
+  if(!tokens()){ setMsUi();
+    if(!rows.length) banner(`Sign in with your Microsoft 365 account to load the WIP report straight from OneDrive. No synced folder or file picking needed.`,[["Sign in with Microsoft",()=>msSignIn(),true],["Not now",()=>banner()]]);
+    return; }
+  try{ if(!ls.get("wipMsUser")){ const me=await (await graph("/me?$select=displayName,mail,userPrincipalName")).json(); ls.set("wipMsUser",me.displayName||me.mail||me.userPrincipalName); } }catch(e){}
+  setMsUi();
+  if(fileDirty && rows.length && ls.get("wipCloudOn")){
+    banner(`You have changes from your last session that weren't saved to OneDrive.`,[
+      ["Load the file and save them",async()=>{ banner(); const keep=rows; await cloudLoad(); if(cloud){ rows=keep; render(); markChanged(); cloudSave(); } },true],
+      ["Discard them and load latest",()=>{ banner(); cloudLoad(); }]]);
+    return;
+  }
+  banner(); await cloudLoad();
+}
 /* ---------- boot ---------- */
 buildHead(); renderStrip();
 let rowsLoaded=false;
@@ -1128,6 +1299,7 @@ let rowsLoaded=false;
     banner(`<b>Save can't update your Excel file in this browser.</b> ${why} Open <b>Makati_Ford_WIP_Board.html</b> from your computer in <b>Microsoft Edge</b> or <b>Google Chrome</b>: right-click the file → <b>Open with</b> → Edge or Chrome. Here, Save downloads an updated copy that you'd have to put back in place of the old file.<span class="diag">${esc(diagText())}</span>`,[["OK",()=>banner()]]);
   }
   if(!window.XLSX) banner(`The Excel library failed to start. Reload this page.`,[["Reload",()=>location.reload(),true]]);
+  await cloudBoot();
 })();
 })();
 
