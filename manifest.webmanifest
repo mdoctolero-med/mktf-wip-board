@@ -1,0 +1,17 @@
+{
+  "name": "Makati Ford WIP Board",
+  "short_name": "WIP Board",
+  "description": "Makati Ford carry-over units: work-in-progress board and RO entry.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone"],
+  "background_color": "#f3f5f9",
+  "theme_color": "#2b4f8f",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
